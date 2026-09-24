@@ -20,7 +20,7 @@
 |---|---|
 | PID | 进程标识符 |
 | 名称 | 可执行文件名（含扩展名） |
-| 完整路径 | `QueryFullProcessImageName` 得到的绝对路径；无权限时显示 `(无法访问)` |
+| 完整路径 | `QueryFullProcessImageName` 绝对路径；PID 4/100 对齐系统 TM 显示 `ntoskrnl.exe`；无权限时 `(无法访问)` |
 | 内存 (MB) | 私有提交量 `PrivateUsage`，单位 MB（一位小数） |
 | CPU (%) | 相对上次采样的 CPU 时间占比（按逻辑处理器数归一化，上限 99.9+） |
 
@@ -69,4 +69,4 @@ taskmgr.exe -selftest
 
 ## 许可
 
-以仓库根目录许可证为准（若未声明则暂按所有者保留全部权利）。
+[MIT](LICENSE)

@@ -34,7 +34,7 @@ if defined WINDRES if defined GCC (
       -DUNICODE -D_UNICODE -Isrc %SRC% "%OBJDIR%\app_res.o" ^
       -o "%OBJDIR%\taskmgr_mingw.exe" ^
       -nostdlib -Wl,--gc-sections -Wl,--no-insert-timestamp -Wl,-e,Entry -s ^
-      -lkernel32 -luser32 -lshell32 -lcomctl32 -lpsapi
+      -lkernel32 -luser32 -lshell32 -lcomctl32 -lpsapi -ladvapi32
     if not errorlevel 1 set "BUILT_MINGW=1"
   )
 )
@@ -61,7 +61,7 @@ if defined MSVC_VER if defined WINSDK (
       /Fo"%OBJDIR%\taskmgr_msvc.obj" /Fe"%OBJDIR%\taskmgr_msvc.exe" ^
       /link /NODEFAULTLIB /ENTRY:Entry /SUBSYSTEM:WINDOWS,6.0 ^
       /OPT:REF /OPT:ICF /MERGE:.rdata=.data ^
-      kernel32.lib user32.lib shell32.lib comctl32.lib psapi.lib >nul 2>&1
+      kernel32.lib user32.lib shell32.lib comctl32.lib psapi.lib advapi32.lib >nul 2>&1
     if not errorlevel 1 set "BUILT_MSVC=1"
   )
 )

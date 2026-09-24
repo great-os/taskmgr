@@ -72,6 +72,7 @@ typedef struct PSLOT {
     wchar_t   name[TM_NAME];
     wchar_t   path[TM_PATH];
     int       pathOk;
+    int       pathNone; /* opened / known pseudo-process, no file image */
     SIZE_T    mem;
     int       cpu10;
     ULONGLONG lastCpu;
@@ -183,18 +184,238 @@ static void RemoveSlotAt(int i)
     g_nslots--;
 }
 
+static int CmpI(const wchar_t *a, const wchar_t *b, int n)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        wchar_t x = a[i], y = b[i];
+        if (x >= L'A' && x <= L'Z') x += 32;
+        if (y >= L'A' && y <= L'Z') y += 32;
+        if (x != y) return (int)x - (int)y;
+        if (!x) return 0;
+    }
+    return 0;
+}
+
+static int DeviceToDos(const wchar_t *in, wchar_t *out, int cap)
+{
+    wchar_t drive[8], tgt[512];
+    int n;
+
+    out[0] = 0;
+    if (!in || !in[0]) return 0;
+    if (in[0] == L'\\') {
+        if (CmpI(in, L"\\SystemRoot\\", 12) == 0) {
+            wchar_t win[260];
+            if (GetWindowsDirectoryW(win, 260)) {
+                n = lstrlenW(win) + lstrlenW(in + 11);
+                if (n + 1 > cap) return 0;
+                lstrcpyW(out, win);
+                lstrcpyW(out + lstrlenW(win), in + 11);
+                return 1;
+            }
+        }
+        if (in[1] == L'?' && in[2] == L'?' && in[3] == L'\\')
+            in += 4;
+        {
+            wchar_t c;
+            for (c = L'A'; c <= L'Z'; c++) {
+                drive[0] = c;
+                drive[1] = L':';
+                drive[2] = 0;
+                if (!QueryDosDeviceW(drive, tgt, 512)) continue;
+                n = lstrlenW(tgt);
+                if (n <= 0) continue;
+                if (CmpI(in, tgt, n) != 0) continue;
+                if (in[n] != 0 && in[n] != L'\\') continue;
+                n = lstrlenW(tgt);
+                if (2 + lstrlenW(in + n) + 1 > cap) return 0;
+                out[0] = c;
+                out[1] = L':';
+                lstrcpyW(out + 2, in + n);
+                return 1;
+            }
+        }
+        return 0;
+    }
+    n = lstrlenW(in);
+    if (n + 1 > cap) return 0;
+    lstrcpyW(out, in);
+    return 1;
+}
+
+static int LooksLikePath(const wchar_t *p)
+{
+    if (!p || !p[0]) return 0;
+    for (; *p; p++) {
+        if (*p == L'\\' || *p == L'/') return 1;
+        if (*p == L':' && p[1]) return 1;
+    }
+    return 0;
+}
+
+typedef LONG (NTAPI *PFN_NtQuerySystemInformation)(ULONG, PVOID, ULONG, PULONG);
+typedef struct TM_UNI {
+    USHORT Length;
+    USHORT MaximumLength;
+    wchar_t *Buffer;
+} TM_UNI;
+typedef struct TM_SPID {
+    void *ProcessId;
+    TM_UNI ImageName;
+} TM_SPID;
+
+static int PathFromSystemPidInfo(DWORD pid, wchar_t *out, int cap)
+{
+    static PFN_NtQuerySystemInformation NtQSI;
+    TM_SPID spi;
+    wchar_t buf[512];
+    ULONG ret = 0;
+    LONG st;
+    int tries = 0;
+
+    if (!NtQSI) {
+        NtQSI = (PFN_NtQuerySystemInformation)
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+                           "NtQuerySystemInformation");
+    }
+    if (!NtQSI) return 0;
+
+    for (;;) {
+        int i;
+        for (i = 0; i < 512; i++) buf[i] = 0;
+        spi.ProcessId = (void *)(ULONG_PTR)pid;
+        spi.ImageName.Length = 0;
+        spi.ImageName.MaximumLength = sizeof(buf);
+        spi.ImageName.Buffer = buf;
+        st = NtQSI(0x58, &spi, sizeof(spi), &ret); /* SystemProcessIdInformation */
+        if (st != (LONG)0xC0000004L) break; /* STATUS_INFO_LENGTH_MISMATCH */
+        if (++tries > 4) break;
+    }
+    if (st == 0 && spi.ImageName.Length) {
+        int ch = spi.ImageName.Length / (int)sizeof(wchar_t);
+        wchar_t dos[TM_PATH];
+        if (ch > 511) ch = 511;
+        buf[ch] = 0;
+        if (DeviceToDos(buf, dos, TM_PATH) && LooksLikePath(dos)) {
+            if (lstrlenW(dos) + 1 > cap) return 0;
+            lstrcpyW(out, dos);
+            return 1;
+        }
+        if (LooksLikePath(buf)) {
+            if (ch + 1 > cap) return 0;
+            lstrcpyW(out, buf);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int PathFromNativeOrPsapi(HANDLE h, wchar_t *out, int cap)
+{
+    wchar_t buf[TM_PATH];
+    DWORD n;
+    DWORD (WINAPI *gipn)(HANDLE, LPWSTR, DWORD);
+
+    /* QueryFullProcessImageName native form */
+    n = TM_PATH;
+    buf[0] = 0;
+    if (QueryFullProcessImageNameW(h, PROCESS_NAME_NATIVE, buf, &n) && buf[0]) {
+        wchar_t dos[TM_PATH];
+        if (DeviceToDos(buf, dos, TM_PATH) && LooksLikePath(dos)) {
+            if (lstrlenW(dos) + 1 > cap) return 0;
+            lstrcpyW(out, dos);
+            return 1;
+        }
+        if (LooksLikePath(buf) && lstrlenW(buf) + 1 <= cap) {
+            lstrcpyW(out, buf);
+            return 1;
+        }
+    }
+
+    gipn = (DWORD (WINAPI *)(HANDLE, LPWSTR, DWORD))
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                       "K32GetProcessImageFileNameW");
+    if (gipn) {
+        buf[0] = 0;
+        if (gipn(h, buf, TM_PATH) && buf[0]) {
+            wchar_t dos[TM_PATH];
+            if (DeviceToDos(buf, dos, TM_PATH) && LooksLikePath(dos)) {
+                if (lstrlenW(dos) + 1 > cap) return 0;
+                lstrcpyW(out, dos);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static void QueryPath(PSLOT *s)
 {
     HANDLE h;
     DWORD n = TM_PATH;
 
     s->pathOk = 0;
+    s->pathNone = 0;
     s->path[0] = 0;
+
+    /* Match system Task Manager: System (PID 4) and Registry (PID 100)
+       both display C:\Windows\System32\ntoskrnl.exe */
+    if (s->pid == 4 || s->pid == 100) {
+        wchar_t sys[260];
+        if (GetSystemDirectoryW(sys, 260)) {
+            lstrcpynW(s->path, sys, TM_PATH);
+            {
+                int L = lstrlenW(s->path);
+                if (L > 0 && s->path[L - 1] == L'\\')
+                    s->path[L - 1] = 0;
+            }
+            if (lstrlenW(s->path) + 13 < TM_PATH)
+                lstrcatW(s->path, L"\\ntoskrnl.exe");
+            s->pathOk = 1;
+            return;
+        }
+    }
+
+    /* Idle: no user-mode image file */
+    if (s->pid == 0) {
+        s->pathNone = 1;
+        return;
+    }
+
     h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, s->pid);
-    if (!h) return;
-    if (QueryFullProcessImageNameW(h, 0, s->path, &n))
+    if (!h) {
+        /* still try system info (works without a process handle) */
+        if (PathFromSystemPidInfo(s->pid, s->path, TM_PATH) &&
+            LooksLikePath(s->path)) {
+            s->pathOk = 1;
+            return;
+        }
+        s->pathNone = 1;
+        return;
+    }
+
+    if (QueryFullProcessImageNameW(h, 0, s->path, &n) && s->path[0] &&
+        LooksLikePath(s->path)) {
         s->pathOk = 1;
+        CloseHandle(h);
+        return;
+    }
+
+    if (PathFromNativeOrPsapi(h, s->path, TM_PATH)) {
+        s->pathOk = 1;
+        CloseHandle(h);
+        return;
+    }
     CloseHandle(h);
+
+    if (PathFromSystemPidInfo(s->pid, s->path, TM_PATH)) {
+        s->pathOk = 1;
+        return;
+    }
+
+    /* Pseudo-processes (e.g. Registry): API may return a bare name, not a path */
+    s->pathNone = 1;
 }
 
 static void QuerySample(PSLOT *s, ULONGLONG nowWall, int ncpu)
@@ -282,7 +503,7 @@ static int SnapshotRefresh(void)
                 lstrcpynW(s->name, pe.szExeFile, TM_NAME);
             if (s) {
                 QuerySample(s, nowWall, ncpu);
-                if (!s->pathOk && !s->path[0])
+                if (!s->pathOk && !s->pathNone && !s->path[0])
                     QueryPath(s);
             }
             pids[np++] = pe.th32ProcessID;
@@ -375,6 +596,7 @@ static int SelPath(wchar_t *out, int cap)
     idx = ListView_GetNextItem(g_list, -1, LVNI_SELECTED);
     if (idx < 0) return -1;
     ListView_GetItemText(g_list, idx, COL_PATH, out, cap);
+    if (!out[0]) return idx; /* empty path cell (pseudo-process) */
     return idx;
 }
 
@@ -434,7 +656,8 @@ static void RebuildList(void)
         if (li.iItem < 0) break;
         ListView_SetItemText(g_list, li.iItem, COL_NAME, s->name);
         ListView_SetItemText(g_list, li.iItem, COL_PATH,
-                             s->pathOk ? s->path : L"(无法访问)");
+                             s->pathOk ? s->path :
+                             (s->pathNone ? L"" : L"(无法访问)"));
         FmtMem(buf, s->mem);
         ListView_SetItemText(g_list, li.iItem, COL_MEM, buf);
         FmtCpu(buf, s->cpu10);
@@ -525,8 +748,9 @@ static void DoKill(void)
 static void DoOpenDir(void)
 {
     wchar_t path[TM_PATH], cmd[TM_PATH + 32];
-    if (SelPath(path, TM_PATH) < 0 || !path[0] || path[0] == L'(') {
-        SetStatus(L"请先选中一个有路径的进程");
+    int idx = SelPath(path, TM_PATH);
+    if (idx < 0 || !path[0] || path[0] == L'(') {
+        SetStatus(L"该进程无文件路径");
         return;
     }
     wsprintfW(cmd, L"/select,\"%s\"", path);
@@ -539,9 +763,10 @@ static void DoCopy(void)
     wchar_t path[TM_PATH];
     HGLOBAL h;
     wchar_t *p;
+    int idx = SelPath(path, TM_PATH);
 
-    if (SelPath(path, TM_PATH) < 0 || !path[0] || path[0] == L'(') {
-        SetStatus(L"请先选中一个有路径的进程");
+    if (idx < 0 || !path[0] || path[0] == L'(') {
+        SetStatus(L"该进程无文件路径");
         return;
     }
     if (!OpenClipboard(g_hwnd)) return;
@@ -731,6 +956,22 @@ static int RunSelfTest(void)
     QueryPath(&probe);
     if (!probe.pathOk) return 4;
 
+    /* PID 4 must resolve like system Task Manager */
+    memset(&probe, 0, sizeof(probe));
+    probe.pid = 4;
+    lstrcpynW(probe.name, L"System", TM_NAME);
+    QueryPath(&probe);
+    if (!probe.pathOk || !LooksLikePath(probe.path)) return 8;
+    if (!ContainsI(probe.path, L"ntoskrnl.exe")) return 9;
+
+    /* Registry: system TM also shows ntoskrnl.exe */
+    memset(&probe, 0, sizeof(probe));
+    probe.pid = 100;
+    lstrcpynW(probe.name, L"Registry", TM_NAME);
+    QueryPath(&probe);
+    if (!probe.pathOk || !LooksLikePath(probe.path)) return 10;
+    if (!ContainsI(probe.path, L"ntoskrnl.exe")) return 11;
+
     if (!SnapshotRefresh()) return 5;
     if (g_nslots < 2) return 6;
 
@@ -746,12 +987,28 @@ static int RunSelfTest(void)
     return 0;
 }
 
+static int IsElevated(void)
+{
+    HANDLE tok = NULL;
+    TOKEN_ELEVATION elev;
+    DWORD n = 0;
+    BOOL ok = FALSE;
+
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        if (GetTokenInformation(tok, TokenElevation, &elev, sizeof(elev), &n))
+            ok = elev.TokenIsElevated;
+        CloseHandle(tok);
+    }
+    return ok;
+}
+
 void Entry(void)
 {
     WNDCLASSEXW wc;
     MSG msg;
     HWND hwnd;
     const wchar_t *cls = L"TaskMgrLiteClass";
+    wchar_t title[64];
     int argc = 0;
     LPWSTR *argv;
     int rc;
@@ -780,7 +1037,11 @@ void Entry(void)
     wc.lpszClassName = cls;
     RegisterClassExW(&wc);
 
-    hwnd = CreateWindowExW(0, cls, L"任务管理器",
+    lstrcpynW(title, L"任务管理器", 64);
+    if (IsElevated())
+        lstrcatW(title, L" - 管理员");
+
+    hwnd = CreateWindowExW(0, cls, title,
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, 900, 560,
         NULL, NULL, wc.hInstance, NULL);
