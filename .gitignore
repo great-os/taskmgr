@@ -1,0 +1,31 @@
+# build output
+obj/
+dist/
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.a
+*.ilk
+*.pdb
+*.exp
+*.map
+
+# runtime / diagnostics
+*.log
+selftest.log
+
+# editors / OS
+.vs/
+.vscode/
+*.user
+Thumbs.db
+Desktop.ini
+
+# secrets / local config
+*.pem
+*.key
+*.pfx
+secrets/
+.env
